@@ -7,7 +7,8 @@ use std::{
     path::Path,
     collections::HashMap,
     cmp::min,
-    panic::{self, AssertUnwindSafe}
+    panic::{self, AssertUnwindSafe},
+    time::Instant,
 };
 use cairo::{ImageSurface, Format, Context, Surface, Rectangle, Antialias};
 use rsvg::{Loader, CairoRenderer, SvgHandle};
@@ -46,10 +47,10 @@ use config::{ButtonConfig, Config};
 use crate::config::ConfigManager;
 
 const BUTTON_SPACING_PX: i32 = 16;
-const BUTTON_COLOR_INACTIVE: f64 = 0.200;
-const BUTTON_COLOR_ACTIVE: f64 = 0.400;
 const ICON_SIZE: i32 = 48;
+
 const TIMEOUT_MS: i32 = 10 * 1000;
+const MAX_FPS: f64 = 30.;
 
 enum ButtonImage {
     Text(String),
@@ -61,7 +62,9 @@ struct Button {
     image: ButtonImage,
     changed: bool,
     active: bool,
-    action: Key
+    action: Key,
+
+    last_action: (f64, Instant), // value when action was performed, when
 }
 
 fn try_load_svg(path: &str) -> Result<ButtonImage> {
@@ -103,6 +106,7 @@ impl Button {
             action,
             active: false,
             changed: false,
+            last_action: (0., Instant::now()),
             image: ButtonImage::Text(text)
         }
     }
@@ -112,9 +116,12 @@ impl Button {
             action, image,
             active: false,
             changed: false,
+            last_action: (0., Instant::now()),
         }
     }
-    fn render(&self, c: &Context, height: i32, button_left_edge: f64, button_width: u64, y_shift: f64) {
+    fn render(&self, config: &Config, c: &Context, height: i32, button_left_edge: f64, button_width: u64, y_shift: f64) {
+        let y_shift = y_shift - self.get_level(config) * config.button_style.bounce;
+
         match &self.image {
             ButtonImage::Text(text) => {
                 let extents = c.text_extents(text).unwrap();
@@ -142,13 +149,41 @@ impl Button {
             }
         }
     }
-    fn set_active<F>(&mut self, uinput: &mut UInputHandle<F>, active: bool) where F: AsRawFd {
+    fn set_active<F>(&mut self, config: &Config, uinput: &mut UInputHandle<F>, active: bool) where F: AsRawFd {
         if self.active != active {
+            self.last_action = (self.get_level(config), Instant::now());
+
             self.active = active;
             self.changed = true;
 
             toggle_key(uinput, self.action, active as i32);
         }
+    }
+
+    // flash level from 0 to 1. scales color
+    fn get_level(&self, conf: &Config) -> f64 {
+        let wanted = if self.active { 1. } else { 0. };
+        let current = self.last_action.0;
+
+        let elapsed = self.last_action.1.elapsed().as_secs_f64();
+        let tau = if self.active { conf.button_style.on_time } else { conf.button_style.off_time };
+        let brightness = wanted + (current - wanted) * (-elapsed / tau).exp();
+        brightness
+    }
+
+    fn get_color(&self, conf: &Config) -> (f64, f64, f64) {
+        let (ir, ig, ib) = conf.button_style.inactive_color;
+        let (ar, ag, ab) = conf.button_style.active_color;
+        let i = self.get_level(conf);
+        let r = ir + (i * (ar - ir));
+        let g = ig + (i * (ag - ig));
+        let b = ib + (i * (ab - ib));
+        (r, g, b)
+    }
+
+    fn needs_redraw(&self, config: &Config) -> bool {
+        let close = (self.get_level(config) - (if self.active { 1. } else { 0. })).abs() < (1. / 256.0);
+        self.changed || !close
     }
 }
 
@@ -189,24 +224,18 @@ impl FunctionLayer {
         c.set_font_face(&config.font_face);
         c.set_font_size(32.0);
         for (i, button) in self.buttons.iter_mut().enumerate() {
-            if !button.changed && !complete_redraw {
+            if !button.needs_redraw(config) && !complete_redraw {
                 continue;
             };
 
             let left_edge = (i as f64 * (button_width + BUTTON_SPACING_PX as f64)).floor() + pixel_shift_x + (pixel_shift_width / 2) as f64;
-            let color = if button.active {
-                BUTTON_COLOR_ACTIVE
-            } else if config.show_button_outlines {
-                BUTTON_COLOR_INACTIVE
-            } else {
-                0.0
-            };
+            let color = button.get_color(config);
             if !complete_redraw {
                 c.set_source_rgb(0.0, 0.0, 0.0);
                 c.rectangle(left_edge, bot - radius, button_width, top - bot + radius * 2.0);
                 c.fill().unwrap();
             }
-            c.set_source_rgb(color, color, color);
+            c.set_source_rgb(color.0, color.1, color.2);
             // draw box with rounded corners
             c.new_sub_path();
             let left = left_edge + radius;
@@ -243,7 +272,7 @@ impl FunctionLayer {
 
             c.fill().unwrap();
             c.set_source_rgb(1.0, 1.0, 1.0);
-            button.render(&c, height, left_edge, button_width.ceil() as u64, pixel_shift_y);
+            button.render(config, &c, height, left_edge, button_width.ceil() as u64, pixel_shift_y);
 
             button.changed = false;
 
@@ -405,7 +434,7 @@ fn real_main(drm: &mut DrmBackend) {
             next_timeout_ms = min(next_timeout_ms, pixel_shift_next_timeout_ms);
         }
 
-        if needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.changed) {
+        if needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.needs_redraw(&cfg)) {
             let shift = if cfg.enable_pixel_shift {
                 pixel_shift.get()
             } else {
@@ -414,8 +443,11 @@ fn real_main(drm: &mut DrmBackend) {
             let clips = layers[active_layer].draw(&cfg, width as i32, height as i32, &surface, shift, needs_complete_redraw);
             let data = surface.data().unwrap();
             drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
-            drm.dirty(&clips).unwrap();
+            if clips.len() > 0 {
+                drm.dirty(&clips).unwrap();
+            }
             needs_complete_redraw = false;
+            next_timeout_ms = (1000. / MAX_FPS) as i32;
         }
 
         match epoll.wait(&mut [EpollEvent::new(EpollFlags::EPOLLIN, 0)], next_timeout_ms as isize) {
@@ -456,7 +488,7 @@ fn real_main(drm: &mut DrmBackend) {
                             let btn = (x / (width as f64 / layers[active_layer].buttons.len() as f64)) as u32;
                             if button_hit(layers[active_layer].buttons.len() as u32, btn, width, height, x, y) {
                                 touches.insert(dn.seat_slot(), (active_layer, btn));
-                                layers[active_layer].buttons[btn as usize].set_active(&mut uinput, true);
+                                layers[active_layer].buttons[btn as usize].set_active(&cfg, &mut uinput, true);
                             }
                         },
                         TouchEvent::Motion(mtn) => {
@@ -468,14 +500,14 @@ fn real_main(drm: &mut DrmBackend) {
                             let y = mtn.y_transformed(height as u32);
                             let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
                             let hit = button_hit(layers[layer].buttons.len() as u32, btn, width, height, x, y);
-                            layers[layer].buttons[btn as usize].set_active(&mut uinput, hit);
+                            layers[layer].buttons[btn as usize].set_active(&cfg, &mut uinput, hit);
                         },
                         TouchEvent::Up(up) => {
                             if !touches.contains_key(&up.seat_slot()) {
                                 continue;
                             }
                             let (layer, btn) = *touches.get(&up.seat_slot()).unwrap();
-                            layers[layer].buttons[btn as usize].set_active(&mut uinput, false);
+                            layers[layer].buttons[btn as usize].set_active(&cfg, &mut uinput, false);
                         }
                         _ => {}
                     }

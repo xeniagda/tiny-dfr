@@ -22,6 +22,16 @@ pub struct Config {
     pub font_face: FontFace,
     pub adaptive_brightness: bool,
     pub active_brightness: u32,
+    pub button_style: ButtonStyle,
+}
+
+#[derive(Clone, Copy)]
+pub struct ButtonStyle {
+    pub inactive_color: (f64, f64, f64),
+    pub active_color: (f64, f64, f64),
+    pub on_time: f64,
+    pub off_time: f64,
+    pub bounce: f64,
 }
 
 #[derive(Deserialize)]
@@ -34,7 +44,18 @@ struct ConfigProxy {
     adaptive_brightness: Option<bool>,
     active_brightness: Option<u32>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
-    media_layer_keys: Option<Vec<ButtonConfig>>
+    media_layer_keys: Option<Vec<ButtonConfig>>,
+    button_style: Option<ButtonStyleProxy>,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "PascalCase")]
+pub struct ButtonStyleProxy {
+    pub inactive_color: Option<(f64, f64, f64)>,
+    pub active_color: Option<(f64, f64, f64)>,
+    pub on_time: Option<f64>,
+    pub off_time: Option<f64>,
+    pub bounce: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -74,6 +95,13 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.media_layer_keys = user.media_layer_keys.or(base.media_layer_keys);
         base.primary_layer_keys = user.primary_layer_keys.or(base.primary_layer_keys);
         base.active_brightness = user.active_brightness.or(base.active_brightness);
+        base.active_brightness = user.active_brightness.or(base.active_brightness);
+        base.button_style = user.button_style.or(base.button_style);
+        base.button_style.unwrap().inactive_color = user.button_style.and_then(|s| s.inactive_color).or(base.button_style.unwrap().inactive_color);
+        base.button_style.unwrap().active_color = user.button_style.and_then(|s| s.active_color).or(base.button_style.unwrap().active_color);
+        base.button_style.unwrap().on_time = user.button_style.and_then(|s| s.on_time).or(base.button_style.unwrap().on_time);
+        base.button_style.unwrap().off_time = user.button_style.and_then(|s| s.off_time).or(base.button_style.unwrap().off_time);
+        base.button_style.unwrap().bounce = user.button_style.and_then(|s| s.bounce).or(base.button_style.unwrap().bounce);
     };
     let media_layer = FunctionLayer::with_config(base.media_layer_keys.unwrap());
     let fkey_layer = FunctionLayer::with_config(base.primary_layer_keys.unwrap());
@@ -83,12 +111,20 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
             layer.buttons.insert(0, Button::new_text("esc".to_string(), Key::Esc));
         }
     }
+    let button_style = ButtonStyle {
+        inactive_color: base.button_style.unwrap().inactive_color.unwrap(),
+        active_color: base.button_style.unwrap().active_color.unwrap(),
+        on_time: base.button_style.unwrap().on_time.unwrap(),
+        off_time: base.button_style.unwrap().off_time.unwrap(),
+        bounce: base.button_style.unwrap().bounce.unwrap().clamp(-5., 5.),
+    };
     let cfg = Config {
         show_button_outlines: base.show_button_outlines.unwrap(),
         enable_pixel_shift: base.enable_pixel_shift.unwrap(),
         adaptive_brightness: base.adaptive_brightness.unwrap(),
         font_face: load_font(&base.font_template.unwrap()),
-        active_brightness: base.active_brightness.unwrap()
+        active_brightness: base.active_brightness.unwrap(),
+        button_style,
     };
     (cfg, layers)
 }

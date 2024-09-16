@@ -84,3 +84,8 @@ MediaLayerKeys = [
     { Icon = "volume_up",       Action = "VolumeUp"       }
 ]
 
+ButtonStyle.InactiveColor = [0.0, 0.05, 0.05]
+ButtonStyle.ActiveColor = [0.4, 0.3, 0.5]
+ButtonStyle.OnTime = 0.05
+ButtonStyle.OffTime = 0.1
+ButtonStyle.Bounce = 5
