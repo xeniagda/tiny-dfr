@@ -65,6 +65,7 @@ struct Button {
     action: Key,
 
     last_action: (f64, Instant), // value when action was performed, when
+    last_rendered_level: f64,
 }
 
 fn try_load_svg(path: &str) -> Result<ButtonImage> {
@@ -107,6 +108,7 @@ impl Button {
             active: false,
             changed: false,
             last_action: (0., Instant::now()),
+            last_rendered_level: 0.,
             image: ButtonImage::Text(text)
         }
     }
@@ -116,11 +118,13 @@ impl Button {
             action, image,
             active: false,
             changed: false,
+            last_rendered_level: 0.,
             last_action: (0., Instant::now()),
         }
     }
-    fn render(&self, config: &Config, c: &Context, height: i32, button_left_edge: f64, button_width: u64, y_shift: f64) {
+    fn render(&mut self, config: &Config, c: &Context, height: i32, button_left_edge: f64, button_width: u64, y_shift: f64) {
         let y_shift = y_shift - self.get_level(config) * config.button_style.bounce;
+        self.last_rendered_level = self.get_level(config);
 
         match &self.image {
             ButtonImage::Text(text) => {
@@ -182,7 +186,7 @@ impl Button {
     }
 
     fn needs_redraw(&self, config: &Config) -> bool {
-        let close = (self.get_level(config) - (if self.active { 1. } else { 0. })).abs() < (1. / 256.0);
+        let close = (self.last_rendered_level - (if self.active { 1. } else { 0. })).abs() < (1. / 256.0);
         self.changed || !close
     }
 }
