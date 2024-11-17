@@ -40,14 +40,21 @@ ActiveBrightness = 128
 # You can change the individual buttons, add, or remove them
 # Any number of keys that is greater than 0 is allowed
 # however rendering will start to break around 24 keys
+# Buttons can be made larger by setting the optional Stretch field
+# to a number greater than 1 (which means the button will take up
+# that many button spaces).
 PrimaryLayerKeys = [
     # Action defines the key code to send when the button is pressed
     # Text defines the button label
     # Icon specifies the icon to be used for the button.
+    # Theme specifies the XDG icons theme.
+    # Stretch specifies how many button spaces the button should take up
+    # and defaults to 1
     # Icons can either be svgs or pngs, with svgs being preferred
     # For best results with pngs, they should be 48x48
     # Do not include the extension in the file name.
-    # Icons are looked up in /etc/tiny-dfr first and then in /usr/share/tiny-dfr
+    # If a Theme is set, icons are looked up in XDG_DATA_DIRS.
+    # Otherwise, they are first looked up in /etc/tiny-dfr, and then in /usr/share/tiny-dfr.
     # Only one of Text or Icon is allowed,
     # if both are present, the behavior is undefined.
     # For the list of supported key codes see
@@ -66,6 +73,23 @@ PrimaryLayerKeys = [
     { Text = "F10", Action = "F10" },
     { Text = "F11", Action = "F11" },
     { Text = "F12", Action = "F12" }
+
+    # Example with Stretch:
+    # # because most buttons have stretch 2, they behave as if they all had 1:
+    # { Text = "F1",  Action = "F1", Stretch = 2  },
+    # { Text = "F2",  Action = "F2", Stretch = 2  },
+    # # these two buttons are half the size of the other buttons:
+    # { Text = "F3",  Action = "F3", Stretch = 1  },
+    # { Text = "F4",  Action = "F4", Stretch = 1  },
+    # { Text = "F5",  Action = "F5", Stretch = 2  },
+    # { Text = "F6",  Action = "F6", Stretch = 2  },
+    # { Text = "F7",  Action = "F7", Stretch = 2  },
+    # # these two buttons are one and a half the size of the other buttons:
+    # { Text = "F8",  Action = "F8", Stretch = 3  },
+    # { Text = "F9",  Action = "F9", Stretch = 3  },
+    # { Text = "F10", Action = "F10", Stretch = 2 },
+    # { Text = "F11", Action = "F11", Stretch = 2 },
+    # { Text = "F12", Action = "F12", Stretch = 2 }
 ]
 
 # This key defines the contents of the media key layer
@@ -82,6 +106,19 @@ MediaLayerKeys = [
     { Icon = "volume_off",      Action = "Mute"           },
     { Icon = "volume_down",     Action = "VolumeDown"     },
     { Icon = "volume_up",       Action = "VolumeUp"       }
+    # Example with XDG icons (requires `breeze-dark` theme installed):
+    # { Icon = "brightness-low",       Theme = "breeze-dark", Action = "BrightnessDown" },
+    # { Icon = "brightness-high",      Theme = "breeze-dark", Action = "BrightnessUp"   },
+    # { Icon = "microphone",           Theme = "breeze-dark", Action = "MicMute"        },
+    # { Icon = "search",               Theme = "breeze-dark", Action = "Search"         },
+    # { Icon = "redshift-status-day",  Theme = "breeze-dark", Action = "IllumDown"      },
+    # { Icon = "redshift-status-on",   Theme = "breeze-dark", Action = "IllumUp"        },
+    # { Icon = "media-skip-backward",  Theme = "breeze-dark", Action = "PreviousSong"   },
+    # { Icon = "media-playback-start", Theme = "breeze-dark", Action = "PlayPause"      },
+    # { Icon = "media-skip-forward",   Theme = "breeze-dark", Action = "NextSong"       },
+    # { Icon = "audio-volume-muted",   Theme = "breeze-dark", Action = "Mute"           },
+    # { Icon = "audio-volume-low",     Theme = "breeze-dark", Action = "VolumeDown"     },
+    # { Icon = "audio-volume-high",    Theme = "breeze-dark", Action = "VolumeUp"       }
 ]
 
 # Color of button when not pressed

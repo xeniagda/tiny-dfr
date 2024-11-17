@@ -4,7 +4,7 @@ use std::{
         fd::{AsRawFd, AsFd},
         unix::{io::OwnedFd, fs::OpenOptionsExt}
     },
-    path::Path,
+    path::{Path, PathBuf},
     collections::HashMap,
     cmp::min,
     panic::{self, AssertUnwindSafe},
@@ -13,7 +13,7 @@ use std::{
 use cairo::{ImageSurface, Format, Context, Surface, Rectangle, Antialias};
 use rsvg::{Loader, CairoRenderer, SvgHandle};
 use drm::control::ClipRect;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use input::{
     Libinput, LibinputInterface, Device as InputDevice,
     event::{
@@ -33,6 +33,7 @@ use nix::{
     errno::Errno
 };
 use privdrop::PrivDrop;
+use freedesktop_icons::lookup;
 
 mod backlight;
 mod display;
@@ -63,22 +64,17 @@ struct Button {
     changed: bool,
     active: bool,
     action: Key,
-
     last_action: (f64, Instant), // value when action was performed, when
     last_rendered_level: f64,
 }
 
-fn try_load_svg(path: &str) -> Result<ButtonImage> {
-    let handle = Loader::new().read_path(format!("/etc/tiny-dfr/{}.svg", path)).or_else(|_| {
-        Loader::new().read_path(format!("/usr/share/tiny-dfr/{}.svg", path))
-    })?;
+fn try_load_svg(path: impl AsRef<Path>) -> Result<ButtonImage> {
+    let handle = Loader::new().read_path(path)?;
     Ok(ButtonImage::Svg(handle))
 }
 
-fn try_load_png(path: &str) -> Result<ButtonImage> {
-    let mut file = File::open(format!("/etc/tiny-dfr/{}.png", path)).or_else(|_| {
-        File::open(format!("/usr/share/tiny-dfr/{}.png", path))
-    })?;
+fn try_load_png(path: impl AsRef<Path>) -> Result<ButtonImage> {
+    let mut file = File::open(path)?;
     let surf = ImageSurface::create_from_png(&mut file)?;
     if surf.height() == ICON_SIZE && surf.width() == ICON_SIZE {
         return Ok(ButtonImage::Bitmap(surf));
@@ -92,12 +88,61 @@ fn try_load_png(path: &str) -> Result<ButtonImage> {
     return Ok(ButtonImage::Bitmap(resized));
 }
 
+fn try_load_image(name: impl AsRef<str>, theme: Option<impl AsRef<str>>) -> Result<ButtonImage> {
+    let name = name.as_ref();
+    let locations;
+
+    // Load list of candidate locations
+    if let Some(theme) = theme {
+        // Freedesktop icons
+        let theme = theme.as_ref();
+        let candidates = vec![
+            lookup(name).with_cache().with_theme(theme).with_size(ICON_SIZE as u16).force_svg().find(),
+            lookup(name).with_cache().with_theme(theme).with_size(ICON_SIZE as u16).find(),
+            lookup(name).with_cache().with_theme(theme).force_svg().find(),
+            lookup(name).with_cache().with_theme(theme).find(),
+        ];
+
+        // .flatten() removes `None` and unwraps `Some` values
+        locations = candidates.into_iter().flatten().collect();
+    } else {
+        // Standard file icons
+        locations = vec![
+            PathBuf::from(format!("/etc/tiny-dfr/{name}.svg")),
+            PathBuf::from(format!("/etc/tiny-dfr/{name}.png")),
+            PathBuf::from(format!("/usr/share/tiny-dfr/{name}.svg")),
+            PathBuf::from(format!("/usr/share/tiny-dfr/{name}.png")),
+        ];
+    };
+
+    // Try to load each candidate
+    let mut last_err = anyhow!("no suitable icon path was found"); // in case locations is empty
+
+    for location in locations {
+        let result = match location.extension().and_then(|s| s.to_str()) {
+            Some("png") => try_load_png(&location),
+            Some("svg") => try_load_svg(&location),
+            _ => Err(anyhow!("invalid file extension")),
+        };
+
+        match result {
+            Ok(image) => return Ok(image),
+            Err(err) => {
+                last_err = err.context(format!("while loading path {}", location.display()));
+            }
+        };
+    }
+
+    // if function hasn't returned by now, all sources have been exhausted
+    Err(last_err.context(format!("failed loading all possible paths for icon {name}")))
+}
+
 impl Button {
     fn with_config(cfg: ButtonConfig) -> Button {
         if let Some(text) = cfg.text {
             Button::new_text(text, cfg.action)
         } else if let Some(icon) = cfg.icon {
-            Button::new_icon(&icon, cfg.action)
+            Button::new_icon(&icon, cfg.theme, cfg.action)
         } else {
             panic!("Invalid config, a button must have either Text or Icon")
         }
@@ -109,11 +154,11 @@ impl Button {
             changed: false,
             last_action: (0., Instant::now()),
             last_rendered_level: 0.,
-            image: ButtonImage::Text(text)
+            image: ButtonImage::Text(text),
         }
     }
-    fn new_icon(path: &str, action: Key) -> Button {
-        let image = try_load_svg(path).or_else(|_| try_load_png(path)).unwrap();
+    fn new_icon(path: impl AsRef<str>, theme: Option<impl AsRef<str>>, action: Key) -> Button {
+        let image = try_load_image(path, theme).expect("failed to load icon");
         Button {
             action, image,
             active: false,
@@ -185,7 +230,7 @@ impl Button {
         (r, g, b)
     }
 
-    fn needs_redraw(&self, config: &Config) -> bool {
+    fn needs_redraw(&self, _config: &Config) -> bool {
         let close = (self.last_rendered_level - (if self.active { 1. } else { 0. })).abs() < (1. / 256.0);
         self.changed || !close
     }
@@ -193,7 +238,8 @@ impl Button {
 
 #[derive(Default)]
 pub struct FunctionLayer {
-    buttons: Vec<Button>
+    buttons: Vec<(usize, Button)>,
+    virtual_button_count: usize,
 }
 
 impl FunctionLayer {
@@ -201,8 +247,20 @@ impl FunctionLayer {
         if cfg.is_empty() {
             panic!("Invalid configuration, layer has 0 buttons");
         }
+        
+        let mut virtual_button_count = 0;
         FunctionLayer {
-            buttons: cfg.into_iter().map(Button::with_config).collect()
+            buttons: cfg.into_iter().scan(&mut virtual_button_count, |state, cfg| {
+                let i = **state;
+                let mut stretch = cfg.stretch.unwrap_or(1);
+                if stretch < 1 {
+                    println!("Stretch value must be at least 1, setting to 1.");
+                    stretch = 1;
+                }
+                **state += stretch;
+                Some((i, Button::with_config(cfg)))
+            }).collect(),
+            virtual_button_count,
         }
     }
     fn draw(&mut self, config: &Config, width: i32, height: i32, surface: &Surface, pixel_shift: (f64, f64), complete_redraw: bool) -> Vec<ClipRect> {
@@ -215,7 +273,7 @@ impl FunctionLayer {
         c.translate(height as f64, 0.0);
         c.rotate((90.0f64).to_radians());
         let pixel_shift_width = if config.enable_pixel_shift { PIXEL_SHIFT_WIDTH_PX } else { 0 };
-        let button_width = ((width - pixel_shift_width as i32) - (BUTTON_SPACING_PX * (self.buttons.len() - 1) as i32)) as f64 / self.buttons.len() as f64;
+        let virtual_button_width = ((width - pixel_shift_width as i32) - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32)) as f64 / self.virtual_button_count as f64;
         let radius = 8.0f64;
         let bot = (height as f64) * 0.15;
         let top = (height as f64) * 0.85;
@@ -227,13 +285,26 @@ impl FunctionLayer {
         }
         c.set_font_face(&config.font_face);
         c.set_font_size(32.0);
-        for (i, button) in self.buttons.iter_mut().enumerate() {
+
+        for i in 0..self.buttons.len() {
+            let end = if i + 1 < self.buttons.len() {
+                self.buttons[i + 1].0
+            } else {
+                self.virtual_button_count
+            };
+            let (start, button) = &mut self.buttons[i];
+            let start = *start;
+
             if !button.needs_redraw(config) && !complete_redraw {
                 continue;
             };
 
-            let left_edge = (i as f64 * (button_width + BUTTON_SPACING_PX as f64)).floor() + pixel_shift_x + (pixel_shift_width / 2) as f64;
-            let color = button.get_color(config);
+            let left_edge = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor() + pixel_shift_x + (pixel_shift_width / 2) as f64;
+
+            let button_width = virtual_button_width + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor();
+
+            let color = button.get_color(&config);
+
             if !complete_redraw {
                 c.set_source_rgb(0.0, 0.0, 0.0);
                 c.rectangle(left_edge, bot - radius, button_width, top - bot + radius * 2.0);
@@ -292,6 +363,36 @@ impl FunctionLayer {
 
         modified_regions
     }
+    
+    fn hit(&self, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
+        let virtual_button_width = (width as i32 - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32)) as f64 / self.virtual_button_count as f64;
+        
+        let i = i.unwrap_or_else(|| {
+            let virtual_i = (x / (width as f64 / self.virtual_button_count as f64)) as usize;
+            self.buttons.iter().position(|(start, _)| *start > virtual_i).unwrap_or(self.buttons.len()) - 1
+        });
+        if i >= self.buttons.len() {
+            return None;
+        }
+        
+        let start = self.buttons[i].0;
+        let end = if i + 1 < self.buttons.len() {
+            self.buttons[i + 1].0
+        } else {
+            self.virtual_button_count
+        };
+        
+        let left_edge = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor();
+
+        let button_width = virtual_button_width + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor();
+        
+        if x < left_edge || x > (left_edge + button_width)
+            || y < 0.1 * height as f64 || y > 0.9 * height as f64 {
+            return None;
+        }
+        
+        Some(i)
+    }
 }
 
 struct Interface;
@@ -313,15 +414,6 @@ impl LibinputInterface for Interface {
     }
 }
 
-
-fn button_hit(num: u32, idx: u32, width: u16, height: u16, x: f64, y: f64) -> bool {
-    let button_width = (width as i32 - (BUTTON_SPACING_PX * (num - 1) as i32)) as f64 / num as f64;
-    let left_edge = idx as f64 * (button_width + BUTTON_SPACING_PX as f64);
-    if x < left_edge || x > (left_edge + button_width) {
-        return false
-    }
-    y > 0.1 * height as f64 && y < 0.9 * height as f64
-}
 
 fn emit<F>(uinput: &mut UInputHandle<F>, ty: EventKind, code: u16, value: i32) where F: AsRawFd {
     uinput.write(&[input_event {
@@ -401,7 +493,7 @@ fn real_main(drm: &mut DrmBackend) {
     uinput.set_evbit(EventKind::Key).unwrap();
     for layer in &layers {
         for button in &layer.buttons {
-            uinput.set_keybit(button.action).unwrap();
+            uinput.set_keybit(button.1.action).unwrap();
         }
     }
     let mut dev_name_c = [0 as c_char; 80];
@@ -438,7 +530,7 @@ fn real_main(drm: &mut DrmBackend) {
             next_timeout_ms = min(next_timeout_ms, pixel_shift_next_timeout_ms);
         }
 
-        if needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.needs_redraw(&cfg)) {
+        if needs_complete_redraw || layers[active_layer].buttons.iter().any(|b| b.1.needs_redraw(&cfg)) {
             let shift = if cfg.enable_pixel_shift {
                 pixel_shift.get()
             } else {
@@ -454,7 +546,7 @@ fn real_main(drm: &mut DrmBackend) {
             next_timeout_ms = (1000. / MAX_FPS) as i32;
         }
 
-        match epoll.wait(&mut [EpollEvent::new(EpollFlags::EPOLLIN, 0)], next_timeout_ms as isize) {
+        match epoll.wait(&mut [EpollEvent::new(EpollFlags::EPOLLIN, 0)], next_timeout_ms as u16) {
             Err(Errno::EINTR) | Ok(_) => { 0 },
             e => e.unwrap(),
         };
@@ -489,10 +581,9 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
-                            let btn = (x / (width as f64 / layers[active_layer].buttons.len() as f64)) as u32;
-                            if button_hit(layers[active_layer].buttons.len() as u32, btn, width, height, x, y) {
+                            if let Some(btn) = layers[active_layer].hit(width, height, x, y, None) {
                                 touches.insert(dn.seat_slot(), (active_layer, btn));
-                                layers[active_layer].buttons[btn as usize].set_active(&cfg, &mut uinput, true);
+                                layers[active_layer].buttons[btn as usize].1.set_active(&cfg, &mut uinput, true);
                             }
                         },
                         TouchEvent::Motion(mtn) => {
@@ -503,15 +594,15 @@ fn real_main(drm: &mut DrmBackend) {
                             let x = mtn.x_transformed(width as u32);
                             let y = mtn.y_transformed(height as u32);
                             let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
-                            let hit = button_hit(layers[layer].buttons.len() as u32, btn, width, height, x, y);
-                            layers[layer].buttons[btn as usize].set_active(&cfg, &mut uinput, hit);
+                            let hit = layers[active_layer].hit(width, height, x, y, Some(btn)).is_some();
+                            layers[layer].buttons[btn].1.set_active(&cfg, &mut uinput, hit);
                         },
                         TouchEvent::Up(up) => {
                             if !touches.contains_key(&up.seat_slot()) {
                                 continue;
                             }
                             let (layer, btn) = *touches.get(&up.seat_slot()).unwrap();
-                            layers[layer].buttons[btn as usize].set_active(&cfg, &mut uinput, false);
+                            layers[layer].buttons[btn].1.set_active(&cfg, &mut uinput, false);
                         }
                         _ => {}
                     }

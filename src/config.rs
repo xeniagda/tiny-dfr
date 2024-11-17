@@ -4,7 +4,7 @@ use std::{
 };
 use anyhow::Error;
 use cairo::FontFace;
-use crate::{FunctionLayer, Button};
+use crate::FunctionLayer;
 use crate::fonts::{FontConfig, Pattern};
 use freetype::Library as FtLibrary;
 use input_linux::Key;
@@ -64,7 +64,9 @@ pub struct ButtonConfig {
     #[serde(alias = "Svg")]
     pub icon: Option<String>,
     pub text: Option<String>,
-    pub action: Key
+    pub theme: Option<String>,
+    pub action: Key,
+    pub stretch: Option<usize>,
 }
 
 fn load_font(name: &str) -> FontFace {
@@ -103,12 +105,11 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.button_style.unwrap().off_time = user.button_style.and_then(|s| s.off_time).or(base.button_style.unwrap().off_time);
         base.button_style.unwrap().bounce = user.button_style.and_then(|s| s.bounce).or(base.button_style.unwrap().bounce);
     };
-    let media_layer = FunctionLayer::with_config(base.media_layer_keys.unwrap());
-    let fkey_layer = FunctionLayer::with_config(base.primary_layer_keys.unwrap());
-    let mut layers = if base.media_layer_default.unwrap(){ [media_layer, fkey_layer] } else { [fkey_layer, media_layer] };
+    let mut media_layer_keys = base.media_layer_keys.unwrap();
+    let mut primary_layer_keys = base.primary_layer_keys.unwrap();
     if width >= 2170 {
-        for layer in &mut layers {
-            layer.buttons.insert(0, Button::new_text("esc".to_string(), Key::Esc));
+        for layer in [&mut media_layer_keys, &mut primary_layer_keys] {
+            layer.insert(0, ButtonConfig { icon: None, text: Some("esc".into()), theme: None, action: Key::Esc, stretch: None });
         }
     }
     let button_style = ButtonStyle {
@@ -118,6 +119,9 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         off_time: base.button_style.unwrap().off_time.unwrap(),
         bounce: base.button_style.unwrap().bounce.unwrap().clamp(-5., 5.),
     };
+    let media_layer = FunctionLayer::with_config(media_layer_keys);
+    let fkey_layer = FunctionLayer::with_config(primary_layer_keys);
+    let layers = if base.media_layer_default.unwrap(){ [media_layer, fkey_layer] } else { [fkey_layer, media_layer] };
     let cfg = Config {
         show_button_outlines: base.show_button_outlines.unwrap(),
         enable_pixel_shift: base.enable_pixel_shift.unwrap(),
